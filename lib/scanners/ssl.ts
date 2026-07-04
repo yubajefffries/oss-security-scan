@@ -7,6 +7,8 @@ import https from 'https';
 import http from 'http';
 import tls from 'tls';
 
+import { resolveAndValidate } from '../validate-domain';
+
 export interface SSLResult {
   status: 'pass' | 'warning' | 'critical' | 'error';
   valid: boolean;
@@ -60,6 +62,19 @@ async function checkHttpsRedirect(domain: string): Promise<boolean> {
 }
 
 export async function scanSSL(domain: string): Promise<SSLResult> {
+  // SSRF guard: never open a TCP/TLS connection to a host that resolves to a
+  // private/internal address (the literal-string check alone does not stop a
+  // public domain pointing at 169.254.169.254 or 10.0.0.1).
+  const guard = await resolveAndValidate(domain);
+  if (!guard.valid) {
+    return {
+      status: 'error',
+      valid: false,
+      issues: [guard.reason ?? 'Domain failed the pre-scan safety check.'],
+      summary: 'Could not scan: the domain failed the pre-scan safety check.',
+    };
+  }
+
   return new Promise((resolve) => {
     const socket = tls.connect(
       {
@@ -117,10 +132,17 @@ export async function scanSSL(domain: string): Promise<SSLResult> {
         // Check domain match (Bug fix P2: wildcard CNs must be properly validated, not blindly accepted)
         const subjectAltNames = cert.subjectaltname ?? '';
         const coveredByCN = subject === domain || matchesWildcard(subject, domain);
-        const coveredBySAN = subjectAltNames.includes(`DNS:${domain}`) ||
-          subjectAltNames.split(', ').some(
-            (san) => san.startsWith('DNS:*.') && matchesWildcard(san.slice(4), domain)
-          );
+        // Bug fix: an unbounded substring match (`includes('DNS:' + domain)`) let a
+        // SAN like "DNS:example.com.evil.com" cover "example.com". Compare each
+        // SAN entry exactly (case-insensitively), with proper wildcard handling.
+        const sanEntries = subjectAltNames
+          .split(',')
+          .map((entry) => entry.trim())
+          .filter((entry) => entry.toLowerCase().startsWith('dns:'))
+          .map((entry) => entry.slice(4).toLowerCase());
+        const coveredBySAN = sanEntries.some(
+          (san) => san === domain || matchesWildcard(san, domain)
+        );
         if (!coveredByCN && !coveredBySAN) {
           issues.push(`Certificate hostname mismatch: issued for "${subject}" but checking "${domain}".`);
         }

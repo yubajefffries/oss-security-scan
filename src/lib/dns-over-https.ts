@@ -77,13 +77,25 @@ async function dohFetch(domain: string, type: string): Promise<DohResponse> {
   return res.json();
 }
 
+/**
+ * DoH providers return long TXT records as multiple quoted chunks,
+ * e.g. `"v=spf1 include:a..." " include:b... -all"`. Stripping only the
+ * outermost quotes left literal `" "` sequences embedded in the value,
+ * corrupting any SPF/DKIM record longer than 255 characters. Extract every
+ * quoted chunk and join them.
+ */
+function parseTxtData(data: string): string {
+  const chunks = data.match(/"([^"]*)"/g);
+  if (!chunks) return data;
+  return chunks.map((c) => c.slice(1, -1)).join('');
+}
 function parseDohResponse(response: DohResponse, requestedType: string): DnsRecord[] {
   if (!response.Answer) return [];
   return response.Answer.map((a) => ({
     name: a.name.replace(/\.$/, ''),
     type: RECORD_TYPE_MAP[a.type] ?? String(a.type),
     ttl: a.TTL,
-    value: a.data.replace(/^"|"$/g, ''), // Strip TXT record quotes
+    value: a.type === 16 ? parseTxtData(a.data) : a.data,
   })).filter((r) => requestedType === 'ANY' || r.type === requestedType);
 }
 
@@ -115,19 +127,19 @@ export async function lookupAll(domain: string): Promise<Record<string, DnsLooku
 
 export async function lookupSpf(domain: string): Promise<DnsRecord | null> {
   const { records } = await queryDns(domain, 'TXT');
-  return records.find((r) => r.value.startsWith('v=spf1')) ?? null;
+  return records.find((r) => r.value.toLowerCase().startsWith('v=spf1')) ?? null;
 }
 
 export async function lookupDmarc(domain: string): Promise<DnsRecord | null> {
   const clean = sanitizeDomain(domain);
   const { records } = await queryDns(`_dmarc.${clean}`, 'TXT');
-  return records.find((r) => r.value.startsWith('v=DMARC1')) ?? null;
+  return records.find((r) => r.value.toLowerCase().startsWith('v=dmarc1')) ?? null;
 }
 
 export async function lookupDkim(domain: string, selector: string): Promise<DnsRecord | null> {
   const clean = sanitizeDomain(domain);
   const { records } = await queryDns(`${selector}._domainkey.${clean}`, 'TXT');
-  return records.find((r) => r.value.includes('v=DKIM1') || r.value.includes('p=')) ?? null;
+  return records.find((r) => /v=dkim1/i.test(r.value) || /(^|;)s*ps*=/i.test(r.value)) ?? null;
 }
 
 /** Reverse IP octets for DNSBL queries (e.g. 1.2.3.4 -> 4.3.2.1) */
@@ -135,15 +147,31 @@ export function reverseIp(ip: string): string {
   return ip.split('.').reverse().join('.');
 }
 
-/** Query a DNSBL - returns A record values if listed, empty array if clean */
-export async function lookupDnsbl(ip: string, blacklistHost: string): Promise<string[]> {
+export interface DnsblLookupResult {
+  /** 'error' means the query failed - the list could NOT be checked (not confirmed clean). */
+  status: 'listed' | 'clean' | 'error';
+  codes: string[];
+}
+
+/**
+ * Query a DNSBL. A failed or SERVFAIL query is reported as status 'error'
+ * so callers can distinguish "confirmed not listed" from "could not check".
+ */
+export async function lookupDnsbl(ip: string, blacklistHost: string): Promise<DnsblLookupResult> {
   const reversed = reverseIp(ip);
   const query = `${reversed}.${blacklistHost}`;
   try {
     const response = await dohFetch(query, 'A');
-    if (!response.Answer || response.Answer.length === 0) return [];
-    return response.Answer.map((a) => a.data);
+    // DNS RCODE 0 = NOERROR, 3 = NXDOMAIN (authoritative "not listed").
+    // Anything else (SERVFAIL, REFUSED, ...) is undeterminable.
+    if (response.Status !== 0 && response.Status !== 3) {
+      return { status: 'error', codes: [] };
+    }
+    if (!response.Answer || response.Answer.length === 0) {
+      return { status: 'clean', codes: [] };
+    }
+    return { status: 'listed', codes: response.Answer.map((a) => a.data) };
   } catch {
-    return [];
+    return { status: 'error', codes: [] };
   }
 }

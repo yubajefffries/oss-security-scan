@@ -8,6 +8,8 @@ export interface BlacklistResult {
   name: string;
   host: string;
   listed: boolean;
+  /** 'error' = the DNSBL query failed; NOT confirmed clean. TODO(UI): render distinctly from a clean result. */
+  queryStatus: 'listed' | 'clean' | 'error';
   returnCodes: string[];
   confidence: Confidence;
   description: string;
@@ -71,8 +73,8 @@ export async function checkBlacklists(ip: string): Promise<BlacklistReport> {
 
   const results = await Promise.allSettled(
     BLACKLISTS.map(async (bl) => {
-      const codes = await lookupDnsbl(ip, bl.host);
-      const listed = codes.length > 0;
+      const { status: queryStatus, codes } = await lookupDnsbl(ip, bl.host);
+      const listed = queryStatus === 'listed';
 
       let confidence: Confidence = 'medium';
       let note: string | undefined;
@@ -95,12 +97,16 @@ export async function checkBlacklists(ip: string): Promise<BlacklistReport> {
         note = 'UCEPROTECT can be aggressive - verify with other lists';
       } else if (listed) {
         confidence = 'high';
+      } else if (queryStatus === 'error') {
+        confidence = 'low';
+        note = 'Query failed - could not check this list (not confirmed clean)';
       }
 
       return {
         name: bl.name,
         host: bl.host,
         listed,
+        queryStatus,
         returnCodes: codes,
         confidence,
         description: bl.description,
@@ -117,6 +123,7 @@ export async function checkBlacklists(ip: string): Promise<BlacklistReport> {
           name: BLACKLISTS[i].name,
           host: BLACKLISTS[i].host,
           listed: false,
+          queryStatus: 'error' as const,
           returnCodes: [],
           confidence: 'low' as Confidence,
           description: BLACKLISTS[i].description,
