@@ -97,6 +97,8 @@ oss-security-scan/
 │   │   ├── headers.ts           # Security headers (via fetch)
 │   │   └── blacklist.ts         # DNSBL queries (via dns/promises)
 │   ├── types.ts                 # TypeScript interfaces
+│   ├── rate-limit.ts            # In-memory per-IP rate limiter
+│   ├── pinned-http.ts           # IP-pinned HTTP(S) requests (anti-rebinding)
 │   └── validate-domain.ts       # Input validation & SSRF prevention
 ├── src/
 │   ├── components/
@@ -132,7 +134,13 @@ oss-security-scan/
 - Server-side connections are pinned to the DNS-validated IP (hostname kept only for Host/SNI/certificate checks), closing the DNS-rebinding window between validation and connect; redirect targets are re-validated and pinned the same way
 - No secrets or API keys required — all checks use public DNS and direct connections
 - Client-side DNS uses HTTPS resolvers (Cloudflare, Google) — no raw DNS from the browser
-- Rate limiting recommended in production (not included — use your platform's rate limiter)
+- Built-in per-IP rate limiting on all scan endpoints (see below)
+
+### Rate Limiting
+
+The scan endpoints apply a small built-in, zero-dependency, in-memory limiter: **10 scans per minute and 100 scans per hour per client IP** (first `x-forwarded-for` entry, falling back to `x-real-ip`, then a shared `unknown` bucket). Over-limit requests get HTTP 429 with a `Retry-After` header.
+
+Because the counters live in process memory, **serverless deployments get per-instance limits** — each warm instance counts separately and cold starts reset the windows. Treat the built-in limiter as a safety net; for heavier or abuse-prone deployments put a real limiter in front (platform WAF rate rules, a Redis-backed limiter, or your CDN).
 
 ## License
 
