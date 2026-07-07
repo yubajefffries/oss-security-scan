@@ -2,6 +2,7 @@ import { useState } from 'react';
 import { lookupAll, lookupSpf, lookupDmarc, lookupDkim, type DnsRecord, type DnsLookupResult } from '../lib/dns-over-https';
 import { DKIM_SELECTORS, computeGrade, computeBestPractices, type EmailAuthResult, type BestPractices } from '../lib/email-auth-grader';
 import { checkBlacklists, type BlacklistReport } from '../lib/blacklist-checker';
+import { checkDnsSecurity, type DnsSecurityReport } from '../lib/dns-security-checker';
 import DomainInput from './shared/DomainInput';
 import CopyButton from './shared/CopyButton';
 import ScanProgress, { type ScanPhase } from './shared/ScanProgress';
@@ -9,6 +10,7 @@ import SecuritySummary from './sections/SecuritySummary';
 import DnsFoundationSection from './sections/DnsFoundationSection';
 import EmailAuthSection from './sections/EmailAuthSection';
 import BlacklistSection from './sections/BlacklistSection';
+import DnsSecuritySection from './sections/DnsSecuritySection';
 import HeadersSection, { type HeadersResult } from './sections/HeadersSection';
 
 interface ScanState {
@@ -21,6 +23,7 @@ interface ScanState {
   dkimRecord: DnsRecord | null;
   blacklist: BlacklistReport | null;
   headers: HeadersResult | null;
+  dnsSecurity: DnsSecurityReport | null;
 }
 
 function formatAllResultsText(state: ScanState): string {
@@ -66,6 +69,22 @@ function formatAllResultsText(state: ScanState): string {
     out += '\n';
   }
 
+  // DNS Security section
+  if (state.dnsSecurity) {
+    const ds = state.dnsSecurity;
+    out += `--- DNS Security ---\n`;
+    out += `DNSSEC: ${ds.dnssec.validated ? 'Enabled and validating' : ds.dnssec.dsFound ? 'DS record found but not validating' : 'Not enabled'}\n`;
+    out += `CAA: ${ds.caa.found ? ds.caa.records.join('; ') : 'No CAA record'}\n`;
+    out += `BIMI: ${ds.bimi.record ? ds.bimi.record.value : 'Not configured'}\n`;
+    out += `MTA-STS: ${ds.mtaSts.txtFound ? 'Record found' : 'Not configured'}`;
+    if (ds.mtaSts.policy) {
+      out += ds.mtaSts.policy.fetched
+        ? ` (policy fetched, mode: ${ds.mtaSts.policy.mode ?? 'unknown'})`
+        : ' (policy file unreachable)';
+    }
+    out += '\n\n';
+  }
+
   // Security Headers section
   if (state.headers) {
     out += `--- Security Headers (${state.headers.score}/${state.headers.maxScore}) ---\n`;
@@ -106,6 +125,7 @@ export default function DomainSecurityScanner() {
       dkimRecord: null,
       blacklist: null,
       headers: null,
+      dnsSecurity: null,
     };
 
     try {
@@ -206,6 +226,40 @@ export default function DomainSecurityScanner() {
         // Headers scan is non-fatal; continue without it
       }
       setCompletedPhases(new Set(['dns', 'email', 'blacklist', 'headers']));
+      setState({ ...scanState });
+
+      // Phase 5: DNS Security (DNSSEC, CAA, BIMI, MTA-STS)
+      setActivePhase('dnssec');
+      try {
+        const dnsSecurity = await checkDnsSecurity(domain);
+        // The mta-sts.txt policy file fetch needs server-side SSRF guards, so
+        // it goes through the API; everything above came from DoH. Non-fatal.
+        if (dnsSecurity.mtaSts.txtFound) {
+          try {
+            const dnsSecRes = await fetch('https://darkhorseitsecurity-yubajefffries-projects.vercel.app/api/scan/dns-security', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ domain }),
+            });
+            if (dnsSecRes.ok) {
+              const dnsSecData = await dnsSecRes.json();
+              if (dnsSecData?.mtaSts) {
+                dnsSecurity.mtaSts.policy = {
+                  fetched: !!dnsSecData.mtaSts.policyFetched,
+                  mode: dnsSecData.mtaSts.mode,
+                  issues: dnsSecData.mtaSts.policyIssues ?? [],
+                };
+              }
+            }
+          } catch {
+            // Policy fetch is non-fatal; the TXT-level results still render
+          }
+        }
+        scanState.dnsSecurity = dnsSecurity;
+      } catch {
+        // DNS security phase is non-fatal; continue without it
+      }
+      setCompletedPhases(new Set(['dns', 'email', 'blacklist', 'headers', 'dnssec']));
       setActivePhase(null);
       setState({ ...scanState });
     } catch {
@@ -275,7 +329,11 @@ export default function DomainSecurityScanner() {
             <HeadersSection result={state.headers} />
           )}
 
-          {completedPhases.size === 4 && (
+          {state.dnsSecurity && (
+            <DnsSecuritySection domain={state.domain} report={state.dnsSecurity} />
+          )}
+
+          {completedPhases.size === 5 && (
             <>
               <div style={{ marginTop: 'var(--space-6)', textAlign: 'center' }}>
                 <CopyButton text={formatAllResultsText(state)} label="Copy All Results" />

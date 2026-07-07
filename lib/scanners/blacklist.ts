@@ -3,7 +3,16 @@
 // License: MIT
 // "Audit the audit" — full transparency by design.
 
-import dns from 'dns/promises';
+import dns, { Resolver } from 'dns/promises';
+
+/**
+ * DNSBL queries go through a dedicated resolver instance backed by the
+ * machine's own configured DNS servers. Public DoH resolvers (Cloudflare,
+ * Google) are blocked or rate-limited by Spamhaus and Barracuda, which
+ * silently under-reports listings - a direct resolver query is
+ * authoritative. Timeouts are capped so one dead DNSBL can't stall the scan.
+ */
+const dnsblResolver = new Resolver({ timeout: 5000, tries: 2 });
 
 export interface BlacklistListing {
   list: string;
@@ -73,6 +82,15 @@ const SPAMHAUS_CODES: Record<string, { sublist: string; severity: 'critical' | '
   '127.0.0.11': { sublist: 'PBL',     severity: 'warning',  explanation: 'This IP is on the Policy Block List (PBL). PBL listings are normal for shared mail server IPs (Google, Microsoft, etc.) and are maintained by ISPs to prevent direct-send abuse. If you\'re using a major email provider, this is expected and typically not a deliverability issue.' },
 };
 
+/**
+ * Spamhaus error-range return codes (127.255.255.0/24): the query was
+ * refused, NOT answered from listing data. 252 = typing error / wrong
+ * query, 253 = query blocked, 254 = query sent via a public/open resolver.
+ * These mean the check could not be performed and must be treated as
+ * unverified - never as clean, and never as a listing.
+ */
+const SPAMHAUS_ERROR_CODES = new Set(['127.255.255.252', '127.255.255.253', '127.255.255.254']);
+
 async function reverseIP(ip: string): Promise<string> {
   return ip.split('.').reverse().join('.');
 }
@@ -88,8 +106,12 @@ async function checkDNSBL(
 ): Promise<DnsblOutcome> {
   try {
     const reversed = await reverseIP(ip);
-    const responseCodes = await dns.resolve4(`${reversed}.${list.host}`);
-    return { outcome: 'listed', responseCodes };
+    const responseCodes = await dnsblResolver.resolve4(`${reversed}.${list.host}`);
+    // Strip Spamhaus error-range codes: they signal a refused/blocked query,
+    // not a listing. A response with only error codes is unverified.
+    const listingCodes = responseCodes.filter((code) => !SPAMHAUS_ERROR_CODES.has(code));
+    if (listingCodes.length === 0) return { outcome: 'error' };
+    return { outcome: 'listed', responseCodes: listingCodes };
   } catch (err) {
     // Only NXDOMAIN/no-data is an authoritative "not listed". Timeouts,
     // SERVFAIL, refusals etc. mean the lookup is UNDETERMINABLE and must

@@ -9,6 +9,8 @@ interface DnsAnswer {
 
 interface DohResponse {
   Status: number;
+  /** AD (Authenticated Data): the resolver validated the response via DNSSEC */
+  AD?: boolean;
   Answer?: DnsAnswer[];
   Authority?: DnsAnswer[];
   Comment?: string;
@@ -33,6 +35,8 @@ const RECORD_TYPE_MAP: Record<number, string> = {
   15: 'MX',
   16: 'TXT',
   28: 'AAAA',
+  43: 'DS',
+  257: 'CAA',
 };
 
 function sanitizeDomain(input: string): string {
@@ -140,6 +144,48 @@ export async function lookupDkim(domain: string, selector: string): Promise<DnsR
   const clean = sanitizeDomain(domain);
   const { records } = await queryDns(`${selector}._domainkey.${clean}`, 'TXT');
   return records.find((r) => /v=dkim1/i.test(r.value) || /(^|;)s*ps*=/i.test(r.value)) ?? null;
+}
+
+export interface DnssecLookupResult {
+  /** DS record present at the parent zone (the delegation is signed) */
+  dsFound: boolean;
+  /** DS present AND the resolver validated the chain (AD flag) */
+  validated: boolean;
+  error?: string;
+}
+
+/**
+ * DNSSEC check via DoH: DS presence at the parent plus the resolver's AD
+ * (Authenticated Data) flag on an ordinary query. The AD flag alone is NOT
+ * enough - unsigned zones also get AD=true on the validated *denial* of a
+ * DS record.
+ */
+export async function lookupDnssec(domain: string): Promise<DnssecLookupResult> {
+  const clean = sanitizeDomain(domain);
+  try {
+    const [ds, soa] = await Promise.all([dohFetch(clean, 'DS'), dohFetch(clean, 'SOA')]);
+    const dsFound = (ds.Answer ?? []).some((a) => a.type === 43); // rrtype 43 = DS
+    return { dsFound, validated: dsFound && soa.AD === true };
+  } catch (err) {
+    return { dsFound: false, validated: false, error: err instanceof Error ? err.message : 'Lookup failed' };
+  }
+}
+
+export async function lookupCaa(domain: string): Promise<DnsLookupResult> {
+  const clean = sanitizeDomain(domain);
+  return queryDns(clean, 'CAA');
+}
+
+export async function lookupBimi(domain: string): Promise<DnsRecord | null> {
+  const clean = sanitizeDomain(domain);
+  const { records } = await queryDns(`default._bimi.${clean}`, 'TXT');
+  return records.find((r) => r.value.toLowerCase().startsWith('v=bimi1')) ?? null;
+}
+
+export async function lookupMtaSts(domain: string): Promise<DnsRecord | null> {
+  const clean = sanitizeDomain(domain);
+  const { records } = await queryDns(`_mta-sts.${clean}`, 'TXT');
+  return records.find((r) => r.value.toLowerCase().startsWith('v=stsv1')) ?? null;
 }
 
 /** Reverse IP octets for DNSBL queries (e.g. 1.2.3.4 -> 4.3.2.1) */
