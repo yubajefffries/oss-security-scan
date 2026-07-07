@@ -7,7 +7,7 @@ import https from 'https';
 import http from 'http';
 import tls from 'tls';
 
-import { resolveAndValidate } from '../validate-domain';
+import { pickConnectAddress, resolveAndValidate } from '../validate-domain';
 
 export interface SSLResult {
   status: 'pass' | 'warning' | 'critical' | 'error';
@@ -46,10 +46,12 @@ function getExpiryDays(validTo: string): number {
   return Math.floor((expiry.getTime() - now.getTime()) / (1000 * 60 * 60 * 24));
 }
 
-async function checkHttpsRedirect(domain: string): Promise<boolean> {
+async function checkHttpsRedirect(domain: string, ip: string): Promise<boolean> {
   return new Promise((resolve) => {
     const req = http.request(
-      { hostname: domain, port: 80, method: 'HEAD', timeout: 5000 },
+      // Pinned: dial the validated IP (never re-resolve the hostname) and
+      // keep the hostname in the Host header so virtual hosts still answer.
+      { host: ip, port: 80, method: 'HEAD', timeout: 5000, headers: { Host: domain } },
       (res) => {
         const location = res.headers.location ?? '';
         resolve(location.startsWith('https://'));
@@ -75,10 +77,15 @@ export async function scanSSL(domain: string): Promise<SSLResult> {
     };
   }
 
+  // IP pinning: dial the vetted address directly so a rebinding nameserver
+  // can't swap in a private address between validation and connect. The
+  // hostname stays in `servername` for SNI and certificate verification.
+  const pinnedIP = pickConnectAddress(guard.addresses);
+
   return new Promise((resolve) => {
     const socket = tls.connect(
       {
-        host: domain,
+        host: pinnedIP,
         port: 443,
         servername: domain,
         timeout: 10000,
@@ -148,7 +155,7 @@ export async function scanSSL(domain: string): Promise<SSLResult> {
         }
 
         // Check HTTP→HTTPS redirect
-        const redirectsToHttps = await checkHttpsRedirect(domain).catch(() => false);
+        const redirectsToHttps = await checkHttpsRedirect(domain, pinnedIP).catch(() => false);
         if (!redirectsToHttps) {
           issues.push('HTTP does not redirect to HTTPS — visitors on http:// get an unsecured connection.');
         }

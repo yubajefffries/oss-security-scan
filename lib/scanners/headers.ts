@@ -3,7 +3,8 @@
 // License: MIT
 // "Audit the audit" — full transparency by design.
 
-import { resolveAndValidate } from '../validate-domain';
+import { pinnedRequest, PINNED_TIMEOUT, type PinnedResponse } from '../pinned-http';
+import { pickConnectAddress, resolveAndValidate } from '../validate-domain';
 
 export interface HeaderCheck {
   name: string;
@@ -91,62 +92,63 @@ export async function scanHeaders(domain: string): Promise<HeadersResult> {
   }
 
   try {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 10000);
+    // Overall time budget shared across redirect hops (matches the previous
+    // single-fetch timeout behavior).
+    const deadline = Date.now() + 10000;
 
-    let response: Response | undefined;
+    let response: PinnedResponse | undefined;
     let redirectNote: string | undefined;
-    try {
-      // SSRF fix: never auto-follow redirects (redirect:'follow' would happily
-      // fetch http://169.254.169.254/ if the target 302s there). We follow at
-      // most MAX_REDIRECTS hops manually, re-validating every hop's hostname
-      // against the same private-address guard before fetching it.
-      let url = `https://${domain}`;
-      for (let hop = 0; ; hop++) {
-        response = await fetch(url, {
-          method: 'HEAD',
-          redirect: 'manual',
-          signal: controller.signal,
-        });
 
-        if (response.status < 300 || response.status >= 400) break;
+    // SSRF fix: never auto-follow redirects (following blindly would happily
+    // fetch http://169.254.169.254/ if the target 302s there). We follow at
+    // most MAX_REDIRECTS hops manually, re-validating every hop's hostname
+    // against the same private-address guard and pinning each connection to
+    // the hop's vetted IP (see pinnedRequest) so DNS rebinding between
+    // validation and connect can't smuggle in a private address.
+    let url = new URL(`https://${domain}`);
+    let ip = pickConnectAddress(guard.addresses);
+    for (let hop = 0; ; hop++) {
+      response = await pinnedRequest(url, ip, {
+        method: 'HEAD',
+        timeoutMs: Math.max(1, deadline - Date.now()),
+      });
 
-        const location = response.headers.get('location');
-        if (!location) break;
+      if (response.statusCode < 300 || response.statusCode >= 400) break;
 
-        let next: URL;
-        try {
-          next = new URL(location, url);
-        } catch {
-          redirectNote = 'Site responded with a redirect to a malformed URL; headers evaluated on the redirect response.';
-          break;
-        }
+      const location = response.headers.location;
+      if (!location) break;
 
-        if (next.protocol !== 'https:' && next.protocol !== 'http:') {
-          redirectNote = `Site redirects to a non-HTTP(S) URL (${next.protocol}//…); redirect not followed.`;
-          break;
-        }
-
-        if (next.port && next.port !== '80' && next.port !== '443') {
-          redirectNote = `Site redirects to a non-standard port (${next.port}); redirect not followed.`;
-          break;
-        }
-
-        if (hop >= MAX_REDIRECTS) {
-          redirectNote = `Stopped after ${MAX_REDIRECTS} redirects; headers evaluated on the last response received.`;
-          break;
-        }
-
-        const hopGuard = await resolveAndValidate(next.hostname);
-        if (!hopGuard.valid) {
-          redirectNote = `Site redirects to "${next.hostname}", which did not pass the safety check — redirect not followed; headers evaluated on the initial response.`;
-          break;
-        }
-
-        url = next.toString();
+      let next: URL;
+      try {
+        next = new URL(location, url);
+      } catch {
+        redirectNote = 'Site responded with a redirect to a malformed URL; headers evaluated on the redirect response.';
+        break;
       }
-    } finally {
-      clearTimeout(timeout);
+
+      if (next.protocol !== 'https:' && next.protocol !== 'http:') {
+        redirectNote = `Site redirects to a non-HTTP(S) URL (${next.protocol}//…); redirect not followed.`;
+        break;
+      }
+
+      if (next.port && next.port !== '80' && next.port !== '443') {
+        redirectNote = `Site redirects to a non-standard port (${next.port}); redirect not followed.`;
+        break;
+      }
+
+      if (hop >= MAX_REDIRECTS) {
+        redirectNote = `Stopped after ${MAX_REDIRECTS} redirects; headers evaluated on the last response received.`;
+        break;
+      }
+
+      const hopGuard = await resolveAndValidate(next.hostname);
+      if (!hopGuard.valid) {
+        redirectNote = `Site redirects to "${next.hostname}", which did not pass the safety check — redirect not followed; headers evaluated on the initial response.`;
+        break;
+      }
+
+      url = next;
+      ip = pickConnectAddress(hopGuard.addresses);
     }
 
     if (!response) {
@@ -155,7 +157,8 @@ export async function scanHeaders(domain: string): Promise<HeadersResult> {
 
     const headers = response.headers;
     const checks: HeaderCheck[] = HEADER_DEFINITIONS.map((def) => {
-      const value = headers.get(def.key) ?? undefined;
+      const raw = headers[def.key];
+      const value = Array.isArray(raw) ? raw.join(', ') : raw;
       return { ...def, found: value !== undefined, value };
     });
 
@@ -183,7 +186,7 @@ export async function scanHeaders(domain: string): Promise<HeadersResult> {
 
     return { status, score, maxScore: HEADER_DEFINITIONS.length, checks, issues, summary: summaries[status] };
   } catch (err) {
-    const isTimeout = err instanceof Error && err.name === 'AbortError';
+    const isTimeout = (err as NodeJS.ErrnoException | undefined)?.code === PINNED_TIMEOUT;
     return errorResult(isTimeout ? 'Scan timed out' : 'Could not connect to the website');
   }
 }

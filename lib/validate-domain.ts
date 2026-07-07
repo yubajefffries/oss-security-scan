@@ -11,10 +11,13 @@
  *    MUST use this — the literal string check alone does not stop a public
  *    domain that resolves to 169.254.169.254 or 10.0.0.1.
  *
- * Known limitation (documented, not fixed here): there is still a small
- * DNS-rebinding TOCTOU window between resolveAndValidate() and the scanner's
- * own connection, since the OS resolver is queried again at connect time.
- * Closing it fully requires pinning the resolved IP in the connection layer.
+ * IP pinning (DNS-rebinding TOCTOU fix): on success, resolveAndValidate()
+ * returns the vetted addresses, and scanners MUST connect directly to one of
+ * them (see pickConnectAddress) instead of the hostname. Connecting by
+ * hostname re-resolves DNS at connect time, letting an attacker's nameserver
+ * return a public IP for validation and a private one for the connection.
+ * The hostname is kept only for the Host header, TLS SNI, and certificate
+ * verification — never for a second lookup.
  */
 
 import dns from 'dns/promises';
@@ -134,14 +137,20 @@ export function validateDomain(hostname: string): { valid: boolean; reason?: str
   return { valid: true };
 }
 
+export type ResolvedTarget =
+  | { valid: true; addresses: string[] }
+  | { valid: false; reason: string };
+
 /**
  * SSRF guard for scanners that connect to the target: performs the syntactic
  * checks, then resolves A/AAAA and rejects if ANY resolved address is
- * private / loopback / link-local / CGNAT / metadata.
+ * private / loopback / link-local / CGNAT / metadata. On success it returns
+ * the vetted addresses (IPv4 first) so the caller can pin its connection to
+ * one of them instead of re-resolving the hostname.
  */
-export async function resolveAndValidate(domain: string): Promise<{ valid: boolean; reason?: string }> {
+export async function resolveAndValidate(domain: string): Promise<ResolvedTarget> {
   const syntactic = validateDomain(domain);
-  if (!syntactic.valid) return syntactic;
+  if (!syntactic.valid) return { valid: false, reason: syntactic.reason ?? 'Invalid domain.' };
 
   const h = domain.trim().toLowerCase();
 
@@ -161,5 +170,13 @@ export async function resolveAndValidate(domain: string): Promise<{ valid: boole
     }
   }
 
-  return { valid: true };
+  return { valid: true, addresses };
+}
+
+/**
+ * Picks the address a scanner should dial from a vetted address list:
+ * prefer IPv4 (broadest server-side reachability), fall back to IPv6.
+ */
+export function pickConnectAddress(addresses: string[]): string {
+  return addresses.find((ip) => net.isIPv4(ip)) ?? addresses[0];
 }

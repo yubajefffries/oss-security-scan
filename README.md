@@ -129,6 +129,7 @@ oss-security-scan/
 ## Security
 
 - All domain inputs are validated against SSRF attacks (private IPs, localhost, metadata endpoints blocked)
+- Server-side connections are pinned to the DNS-validated IP (hostname kept only for Host/SNI/certificate checks), closing the DNS-rebinding window between validation and connect; redirect targets are re-validated and pinned the same way
 - No secrets or API keys required — all checks use public DNS and direct connections
 - Client-side DNS uses HTTPS resolvers (Cloudflare, Google) — no raw DNS from the browser
 - Rate limiting recommended in production (not included — use your platform's rate limiter)
