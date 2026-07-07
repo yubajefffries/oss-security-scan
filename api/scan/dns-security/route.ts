@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { scanHeaders } from '@/lib/scanners/headers';
+import { scanDnsSecurity } from '@/lib/scanners/dns-security';
 import { checkRateLimit, getClientIp } from '@/lib/rate-limit';
 import { validateDomain } from '@/lib/validate-domain';
 
@@ -35,10 +35,10 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ error: validation.reason }, { status: 400 });
     }
 
-    const result = await scanHeaders(cleaned);
+    const result = await scanDnsSecurity(cleaned);
     return NextResponse.json(result);
   } catch (err) {
-    console.error('Headers scan error:', err);
+    console.error('DNS security scan error:', err);
     return NextResponse.json({ error: 'Scan failed' }, { status: 500 });
   }
 }

@@ -2,7 +2,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](./LICENSE)
 
-An all-in-one domain and email security scanner. One scan runs four phases: DNS foundation, email authentication (SPF/DKIM/DMARC), email blocklist status, and security headers.
+An all-in-one domain and email security scanner. One scan runs five phases: DNS foundation, email authentication (SPF/DKIM/DMARC), email blocklist status, security headers, and DNS security (DNSSEC/CAA/BIMI/MTA-STS).
 
 Built by [DarkHorse IT](https://darkhorseit.com). "Audit the audit" — full transparency by design.
 
@@ -14,6 +14,11 @@ Built by [DarkHorse IT](https://darkhorseit.com). "Audit the audit" — full tra
 | 2 | **Email Authentication** | SPF record & policy, DKIM selectors (9 common), DMARC policy & enforcement, A-F grading |
 | 3 | **Email Blocklists** | Spamhaus ZEN (with return code classification), Barracuda BRBL, SpamCop, SORBS, UCEPROTECT L1, Abuseat CBL |
 | 4 | **Security Headers** | HSTS, CSP, X-Frame-Options, X-Content-Type-Options, Referrer-Policy, Permissions-Policy |
+| 5 | **DNS Security** | DNSSEC (DS record + validated AD flag), CAA records, BIMI (`default._bimi` TXT), MTA-STS (TXT + policy file fetch via the server API) |
+
+> **Note on blocklist results:** the browser-side blocklist phase queries through public DNS-over-HTTPS resolvers, which Spamhaus and Barracuda block or rate-limit — so it can under-report listings. The server-side `/api/scan/blacklist` endpoint queries through the machine's own resolver and classifies Spamhaus error return codes (`127.255.255.252/253/254` = blocked/open-resolver query, reported as "could not check", never as clean); its results are authoritative.
+>
+> **Note on DNSSEC:** Node's built-in resolver cannot query DS/DNSKEY record types, so the server-side DNSSEC check uses Cloudflare's DNS-over-HTTPS JSON API (a fixed, trusted endpoint — the only external service the server-side scanners call).
 
 ## What's Included
 
@@ -26,10 +31,10 @@ This repo contains two layers:
 
 The `src/` directory contains a complete React-based scanner UI:
 
-- **`DomainSecurityScanner`** — Orchestrator component that runs all 4 scan phases with progressive results
-- **Section components** — DNS Foundation, Email Auth (with A-F grading), Blacklist Check, Security Headers
+- **`DomainSecurityScanner`** — Orchestrator component that runs all 5 scan phases with progressive results
+- **Section components** — DNS Foundation, Email Auth (with A-F grading), Blacklist Check, Security Headers, DNS Security
 - **Shared components** — Domain input with validation, scan progress indicator, copy-to-clipboard, insight cards, best practice badges
-- **Libraries** — DNS-over-HTTPS resolver, email auth grader, blacklist checker (all browser-compatible, zero server dependencies)
+- **Libraries** — DNS-over-HTTPS resolver, email auth grader, blacklist checker, DNS security checker (all browser-compatible, zero server dependencies)
 
 ### Server-Side API
 
@@ -79,6 +84,11 @@ curl -X POST http://localhost:3000/api/scan/headers \
 curl -X POST http://localhost:3000/api/scan/blacklist \
   -H "Content-Type: application/json" \
   -d '{"domain": "example.com"}'
+
+# DNS security check (DNSSEC, CAA, BIMI, MTA-STS)
+curl -X POST http://localhost:3000/api/scan/dns-security \
+  -H "Content-Type: application/json" \
+  -d '{"domain": "example.com"}'
 ```
 
 ## Project Structure
@@ -89,14 +99,18 @@ oss-security-scan/
 │   ├── email-auth/route.ts
 │   ├── ssl/route.ts
 │   ├── headers/route.ts
-│   └── blacklist/route.ts
+│   ├── blacklist/route.ts
+│   └── dns-security/route.ts
 ├── lib/
 │   ├── scanners/                # Server-side scanning logic
 │   │   ├── email-auth.ts        # SPF, DKIM, DMARC (via dns/promises)
 │   │   ├── ssl.ts               # Certificate & TLS (via tls, https)
-│   │   ├── headers.ts           # Security headers (via fetch)
-│   │   └── blacklist.ts         # DNSBL queries (via dns/promises)
+│   │   ├── headers.ts           # Security headers (via pinned https)
+│   │   ├── blacklist.ts         # DNSBL queries (via dns Resolver)
+│   │   └── dns-security.ts      # DNSSEC, CAA, BIMI, MTA-STS
 │   ├── types.ts                 # TypeScript interfaces
+│   ├── rate-limit.ts            # In-memory per-IP rate limiter
+│   ├── pinned-http.ts           # IP-pinned HTTP(S) requests (anti-rebinding)
 │   └── validate-domain.ts       # Input validation & SSRF prevention
 ├── src/
 │   ├── components/
@@ -106,6 +120,7 @@ oss-security-scan/
 │   │   │   ├── EmailAuthSection.tsx
 │   │   │   ├── BlacklistSection.tsx
 │   │   │   ├── HeadersSection.tsx
+│   │   │   ├── DnsSecuritySection.tsx
 │   │   │   └── SecuritySummary.tsx
 │   │   └── shared/
 │   │       ├── BestPracticeBadge.tsx
@@ -117,6 +132,7 @@ oss-security-scan/
 │   │   ├── dns-over-https.ts    # Browser-side DNS resolver (Cloudflare + Google)
 │   │   ├── email-auth-grader.ts # A-F grading algorithm
 │   │   ├── blacklist-checker.ts # DNSBL checker with false-positive filtering
+│   │   ├── dns-security-checker.ts # DNSSEC, CAA, BIMI, MTA-STS via DoH
 │   │   └── copy-results.ts     # Clipboard utility
 │   └── styles/
 │       └── tools.css            # Component styles (CSS custom properties)
@@ -129,9 +145,16 @@ oss-security-scan/
 ## Security
 
 - All domain inputs are validated against SSRF attacks (private IPs, localhost, metadata endpoints blocked)
+- Server-side connections are pinned to the DNS-validated IP (hostname kept only for Host/SNI/certificate checks), closing the DNS-rebinding window between validation and connect; redirect targets are re-validated and pinned the same way
 - No secrets or API keys required — all checks use public DNS and direct connections
 - Client-side DNS uses HTTPS resolvers (Cloudflare, Google) — no raw DNS from the browser
-- Rate limiting recommended in production (not included — use your platform's rate limiter)
+- Built-in per-IP rate limiting on all scan endpoints (see below)
+
+### Rate Limiting
+
+The scan endpoints apply a small built-in, zero-dependency, in-memory limiter: **10 scans per minute and 100 scans per hour per client IP** (first `x-forwarded-for` entry, falling back to `x-real-ip`, then a shared `unknown` bucket). Over-limit requests get HTTP 429 with a `Retry-After` header.
+
+Because the counters live in process memory, **serverless deployments get per-instance limits** — each warm instance counts separately and cold starts reset the windows. Treat the built-in limiter as a safety net; for heavier or abuse-prone deployments put a real limiter in front (platform WAF rate rules, a Redis-backed limiter, or your CDN).
 
 ## License
 

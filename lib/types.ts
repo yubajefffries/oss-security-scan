@@ -5,6 +5,7 @@ export interface ScanResults {
   ssl?: import('./scanners/ssl').SSLResult;
   headers?: import('./scanners/headers').HeadersResult;
   blacklist?: import('./scanners/blacklist').BlacklistResult;
+  dnsSecurity?: import('./scanners/dns-security').DnsSecurityResult;
 }
 
 export type ScanKey = keyof ScanResults;

@@ -1,4 +1,4 @@
-export type ScanPhase = 'dns' | 'email' | 'blacklist' | 'headers';
+export type ScanPhase = 'dns' | 'email' | 'blacklist' | 'headers' | 'dnssec';
 
 interface Props {
   completed: Set<ScanPhase>;
@@ -10,6 +10,7 @@ const STEPS: { key: ScanPhase; label: string }[] = [
   { key: 'email', label: 'Email Auth' },
   { key: 'blacklist', label: 'Blacklist Check' },
   { key: 'headers', label: 'Security Headers' },
+  { key: 'dnssec', label: 'DNS Security' },
 ];
 
 export default function ScanProgress({ completed, active }: Props) {

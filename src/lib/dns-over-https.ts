@@ -9,6 +9,8 @@ interface DnsAnswer {
 
 interface DohResponse {
   Status: number;
+  /** AD (Authenticated Data): the resolver validated the response via DNSSEC */
+  AD?: boolean;
   Answer?: DnsAnswer[];
   Authority?: DnsAnswer[];
   Comment?: string;
@@ -33,6 +35,8 @@ const RECORD_TYPE_MAP: Record<number, string> = {
   15: 'MX',
   16: 'TXT',
   28: 'AAAA',
+  43: 'DS',
+  257: 'CAA',
 };
 
 function sanitizeDomain(input: string): string {
@@ -77,13 +81,25 @@ async function dohFetch(domain: string, type: string): Promise<DohResponse> {
   return res.json();
 }
 
+/**
+ * DoH providers return long TXT records as multiple quoted chunks,
+ * e.g. `"v=spf1 include:a..." " include:b... -all"`. Stripping only the
+ * outermost quotes left literal `" "` sequences embedded in the value,
+ * corrupting any SPF/DKIM record longer than 255 characters. Extract every
+ * quoted chunk and join them.
+ */
+function parseTxtData(data: string): string {
+  const chunks = data.match(/"([^"]*)"/g);
+  if (!chunks) return data;
+  return chunks.map((c) => c.slice(1, -1)).join('');
+}
 function parseDohResponse(response: DohResponse, requestedType: string): DnsRecord[] {
   if (!response.Answer) return [];
   return response.Answer.map((a) => ({
     name: a.name.replace(/\.$/, ''),
     type: RECORD_TYPE_MAP[a.type] ?? String(a.type),
     ttl: a.TTL,
-    value: a.data.replace(/^"|"$/g, ''), // Strip TXT record quotes
+    value: a.type === 16 ? parseTxtData(a.data) : a.data,
   })).filter((r) => requestedType === 'ANY' || r.type === requestedType);
 }
 
@@ -115,19 +131,61 @@ export async function lookupAll(domain: string): Promise<Record<string, DnsLooku
 
 export async function lookupSpf(domain: string): Promise<DnsRecord | null> {
   const { records } = await queryDns(domain, 'TXT');
-  return records.find((r) => r.value.startsWith('v=spf1')) ?? null;
+  return records.find((r) => r.value.toLowerCase().startsWith('v=spf1')) ?? null;
 }
 
 export async function lookupDmarc(domain: string): Promise<DnsRecord | null> {
   const clean = sanitizeDomain(domain);
   const { records } = await queryDns(`_dmarc.${clean}`, 'TXT');
-  return records.find((r) => r.value.startsWith('v=DMARC1')) ?? null;
+  return records.find((r) => r.value.toLowerCase().startsWith('v=dmarc1')) ?? null;
 }
 
 export async function lookupDkim(domain: string, selector: string): Promise<DnsRecord | null> {
   const clean = sanitizeDomain(domain);
   const { records } = await queryDns(`${selector}._domainkey.${clean}`, 'TXT');
-  return records.find((r) => r.value.includes('v=DKIM1') || r.value.includes('p=')) ?? null;
+  return records.find((r) => /v=dkim1/i.test(r.value) || /(^|;)s*ps*=/i.test(r.value)) ?? null;
+}
+
+export interface DnssecLookupResult {
+  /** DS record present at the parent zone (the delegation is signed) */
+  dsFound: boolean;
+  /** DS present AND the resolver validated the chain (AD flag) */
+  validated: boolean;
+  error?: string;
+}
+
+/**
+ * DNSSEC check via DoH: DS presence at the parent plus the resolver's AD
+ * (Authenticated Data) flag on an ordinary query. The AD flag alone is NOT
+ * enough - unsigned zones also get AD=true on the validated *denial* of a
+ * DS record.
+ */
+export async function lookupDnssec(domain: string): Promise<DnssecLookupResult> {
+  const clean = sanitizeDomain(domain);
+  try {
+    const [ds, soa] = await Promise.all([dohFetch(clean, 'DS'), dohFetch(clean, 'SOA')]);
+    const dsFound = (ds.Answer ?? []).some((a) => a.type === 43); // rrtype 43 = DS
+    return { dsFound, validated: dsFound && soa.AD === true };
+  } catch (err) {
+    return { dsFound: false, validated: false, error: err instanceof Error ? err.message : 'Lookup failed' };
+  }
+}
+
+export async function lookupCaa(domain: string): Promise<DnsLookupResult> {
+  const clean = sanitizeDomain(domain);
+  return queryDns(clean, 'CAA');
+}
+
+export async function lookupBimi(domain: string): Promise<DnsRecord | null> {
+  const clean = sanitizeDomain(domain);
+  const { records } = await queryDns(`default._bimi.${clean}`, 'TXT');
+  return records.find((r) => r.value.toLowerCase().startsWith('v=bimi1')) ?? null;
+}
+
+export async function lookupMtaSts(domain: string): Promise<DnsRecord | null> {
+  const clean = sanitizeDomain(domain);
+  const { records } = await queryDns(`_mta-sts.${clean}`, 'TXT');
+  return records.find((r) => r.value.toLowerCase().startsWith('v=stsv1')) ?? null;
 }
 
 /** Reverse IP octets for DNSBL queries (e.g. 1.2.3.4 -> 4.3.2.1) */
@@ -135,15 +193,31 @@ export function reverseIp(ip: string): string {
   return ip.split('.').reverse().join('.');
 }
 
-/** Query a DNSBL - returns A record values if listed, empty array if clean */
-export async function lookupDnsbl(ip: string, blacklistHost: string): Promise<string[]> {
+export interface DnsblLookupResult {
+  /** 'error' means the query failed - the list could NOT be checked (not confirmed clean). */
+  status: 'listed' | 'clean' | 'error';
+  codes: string[];
+}
+
+/**
+ * Query a DNSBL. A failed or SERVFAIL query is reported as status 'error'
+ * so callers can distinguish "confirmed not listed" from "could not check".
+ */
+export async function lookupDnsbl(ip: string, blacklistHost: string): Promise<DnsblLookupResult> {
   const reversed = reverseIp(ip);
   const query = `${reversed}.${blacklistHost}`;
   try {
     const response = await dohFetch(query, 'A');
-    if (!response.Answer || response.Answer.length === 0) return [];
-    return response.Answer.map((a) => a.data);
+    // DNS RCODE 0 = NOERROR, 3 = NXDOMAIN (authoritative "not listed").
+    // Anything else (SERVFAIL, REFUSED, ...) is undeterminable.
+    if (response.Status !== 0 && response.Status !== 3) {
+      return { status: 'error', codes: [] };
+    }
+    if (!response.Answer || response.Answer.length === 0) {
+      return { status: 'clean', codes: [] };
+    }
+    return { status: 'listed', codes: response.Answer.map((a) => a.data) };
   } catch {
-    return [];
+    return { status: 'error', codes: [] };
   }
 }

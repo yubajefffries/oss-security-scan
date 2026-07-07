@@ -1,11 +1,22 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { scanEmailAuth } from '@/lib/scanners/email-auth';
+import { checkRateLimit, getClientIp } from '@/lib/rate-limit';
 import { validateDomain } from '@/lib/validate-domain';
 
 export const runtime = 'nodejs';
 export const maxDuration = 30;
 
 export async function POST(req: NextRequest) {
+  // Rate limit before doing any work: every scan triggers outbound DNS and
+  // network activity on the caller's behalf.
+  const rate = checkRateLimit(getClientIp(req.headers));
+  if (!rate.allowed) {
+    return NextResponse.json(
+      { error: 'Too many requests. Try again shortly.' },
+      { status: 429, headers: { 'Retry-After': String(rate.retryAfterSeconds) } }
+    );
+  }
+
   try {
     const { domain } = await req.json();
 

@@ -45,16 +45,37 @@ const DKIM_SELECTORS = [
   's1', 's2', 'protonmail', 'mailchimp',
 ];
 
+/**
+ * Joins the 255-character TXT chunks of each record before matching.
+ * A naive .flat() treats each chunk as its own record, truncating any
+ * SPF/DMARC record longer than 255 characters.
+ */
+function joinTxtChunks(records: string[][]): string[] {
+  return records.map((chunks) => chunks.join(''));
+}
+
+/**
+ * Counts DNS-querying terms per RFC 7208 section 4.6.4: the include, a, mx,
+ * ptr, and exists mechanisms (bare or with arguments, any qualifier) plus
+ * the redirect= modifier. The previous regex only matched "mechanism:"
+ * forms, missing bare "a"/"mx" and redirect= entirely.
+ */
 function countSpfLookups(record: string): number {
-  const lookupMechanisms = /\b(include:|a:|mx:|ptr:|exists:)/g;
-  return (record.match(lookupMechanisms) || []).length;
+  const terms = record.trim().split(/\s+/).slice(1); // skip "v=spf1"
+  let count = 0;
+  for (const rawTerm of terms) {
+    const term = rawTerm.toLowerCase().replace(/^[+\-~?]/, '');
+    if (/^(include|exists):/.test(term)) count++;
+    else if (/^(a|mx|ptr)(:|\/|$)/.test(term)) count++;
+    else if (/^redirect=/.test(term)) count++;
+  }
+  return count;
 }
 
 async function checkSpf(domain: string): Promise<SpfResult> {
   try {
     const records = await dns.resolveTxt(domain);
-    const spfRecord = records
-      .flat()
+    const spfRecord = joinTxtChunks(records)
       .find((r) => r.toLowerCase().startsWith('v=spf1'));
 
     if (!spfRecord) {
@@ -65,26 +86,40 @@ async function checkSpf(domain: string): Promise<SpfResult> {
     }
 
     const issues: string[] = [];
-    let policy: SpfResult['policy'] = 'softfail';
+    let policy: SpfResult['policy'];
 
-    if (spfRecord.includes('+all')) {
+    // Locate the "all" mechanism as a standalone term (case-insensitive).
+    // Substring checks like record.includes('-all') missed uppercase variants
+    // and, worse, graded a bare "all" (implicit "+all", i.e. anyone may send)
+    // as a safe softfail default.
+    const terms = spfRecord.trim().split(/\s+/).slice(1).map((t) => t.toLowerCase());
+    const allTerm = terms.find((t) => /^[+\-~?]?all$/.test(t));
+    const hasRedirect = terms.some((t) => t.startsWith('redirect='));
+
+    if (allTerm === '+all' || allTerm === 'all') {
       policy = 'dangerous';
-      issues.push('SPF uses "+all" — this allows anyone to send email as your domain.');
-    } else if (spfRecord.includes('-all')) {
+      issues.push(
+        allTerm === 'all'
+          ? 'SPF ends with a bare "all" (implicit "+all") - this allows anyone to send email as your domain. Use "-all" instead.'
+          : 'SPF uses "+all" - this allows anyone to send email as your domain.'
+      );
+    } else if (allTerm === '-all') {
       policy = 'hardfail';
-    } else if (spfRecord.includes('~all')) {
+    } else if (allTerm === '~all') {
       policy = 'softfail';
-      issues.push('SPF uses "~all" (softfail) — unauthorized emails may still be delivered. Consider "-all" for strict enforcement.');
-    } else if (spfRecord.includes('?all')) {
+      issues.push('SPF uses "~all" (softfail) - unauthorized emails may still be delivered. Consider "-all" for strict enforcement.');
+    } else if (allTerm === '?all') {
       policy = 'neutral';
-      issues.push('SPF uses "?all" (neutral) — provides no protection against spoofing.');
-    } else if (!spfRecord.includes('all')) {
-      issues.push('SPF record is missing an "all" mechanism — incomplete protection.');
+      issues.push('SPF uses "?all" (neutral) - provides no protection against spoofing.');
+    } else if (!hasRedirect) {
+      // redirect= legitimately replaces "all" (RFC 7208 section 6.1), so only
+      // flag a missing "all" when there is no redirect modifier either.
+      issues.push('SPF record is missing an "all" mechanism - incomplete protection.');
     }
 
     const lookupCount = countSpfLookups(spfRecord);
     if (lookupCount > 10) {
-      issues.push(`SPF record has ${lookupCount} DNS lookups (max is 10) — emails may be rejected.`);
+      issues.push(`SPF record has ${lookupCount} DNS lookups (max is 10) - emails may be rejected.`);
     }
 
     return { found: true, record: spfRecord, policy, lookupCount, issues };
@@ -96,8 +131,7 @@ async function checkSpf(domain: string): Promise<SpfResult> {
 async function checkDmarc(domain: string): Promise<DmarcResult> {
   try {
     const records = await dns.resolveTxt(`_dmarc.${domain}`);
-    const dmarcRecord = records
-      .flat()
+    const dmarcRecord = joinTxtChunks(records)
       .find((r) => r.toLowerCase().startsWith('v=dmarc1'));
 
     if (!dmarcRecord) {
@@ -114,13 +148,13 @@ async function checkDmarc(domain: string): Promise<DmarcResult> {
     const hasReporting = dmarcRecord.includes('rua=') || dmarcRecord.includes('ruf=');
 
     if (policy === 'none') {
-      issues.push('DMARC policy is "none" — monitoring only, no protection. Upgrade to "quarantine" or "reject".');
+      issues.push('DMARC policy is "none" - monitoring only, no protection. Upgrade to "quarantine" or "reject".');
     } else if (policy === 'quarantine') {
-      issues.push('DMARC policy is "quarantine" — spoofed emails go to spam. Consider upgrading to "reject" for full protection.');
+      issues.push('DMARC policy is "quarantine" - spoofed emails go to spam. Consider upgrading to "reject" for full protection.');
     }
 
     if (!hasReporting) {
-      issues.push('No DMARC reporting address (rua=) configured — you won\'t receive alerts about spoofing attempts.');
+      issues.push('No DMARC reporting address (rua=) configured - you won\'t receive alerts about spoofing attempts.');
     }
 
     return { found: true, record: dmarcRecord, policy, hasReporting, issues };
@@ -137,8 +171,13 @@ async function checkDkim(domain: string): Promise<{ selectorsChecked: DkimSelect
   const results = await Promise.allSettled(
     DKIM_SELECTORS.map(async (selector) => {
       try {
-        await dns.resolveTxt(`${selector}._domainkey.${domain}`);
-        return { selector, found: true };
+        const records = await dns.resolveTxt(`${selector}._domainkey.${domain}`);
+        // Require an actual DKIM key record. Any stray TXT at the selector
+        // (e.g. a wildcard TXT record) must not count as "DKIM found".
+        const found = joinTxtChunks(records).some(
+          (r) => /v=dkim1/i.test(r) || /(^|;)\s*p\s*=/i.test(r)
+        );
+        return { selector, found };
       } catch {
         return { selector, found: false };
       }

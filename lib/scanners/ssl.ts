@@ -7,6 +7,8 @@ import https from 'https';
 import http from 'http';
 import tls from 'tls';
 
+import { pickConnectAddress, resolveAndValidate } from '../validate-domain';
+
 export interface SSLResult {
   status: 'pass' | 'warning' | 'critical' | 'error';
   valid: boolean;
@@ -44,10 +46,12 @@ function getExpiryDays(validTo: string): number {
   return Math.floor((expiry.getTime() - now.getTime()) / (1000 * 60 * 60 * 24));
 }
 
-async function checkHttpsRedirect(domain: string): Promise<boolean> {
+async function checkHttpsRedirect(domain: string, ip: string): Promise<boolean> {
   return new Promise((resolve) => {
     const req = http.request(
-      { hostname: domain, port: 80, method: 'HEAD', timeout: 5000 },
+      // Pinned: dial the validated IP (never re-resolve the hostname) and
+      // keep the hostname in the Host header so virtual hosts still answer.
+      { host: ip, port: 80, method: 'HEAD', timeout: 5000, headers: { Host: domain } },
       (res) => {
         const location = res.headers.location ?? '';
         resolve(location.startsWith('https://'));
@@ -60,10 +64,28 @@ async function checkHttpsRedirect(domain: string): Promise<boolean> {
 }
 
 export async function scanSSL(domain: string): Promise<SSLResult> {
+  // SSRF guard: never open a TCP/TLS connection to a host that resolves to a
+  // private/internal address (the literal-string check alone does not stop a
+  // public domain pointing at 169.254.169.254 or 10.0.0.1).
+  const guard = await resolveAndValidate(domain);
+  if (!guard.valid) {
+    return {
+      status: 'error',
+      valid: false,
+      issues: [guard.reason ?? 'Domain failed the pre-scan safety check.'],
+      summary: 'Could not scan: the domain failed the pre-scan safety check.',
+    };
+  }
+
+  // IP pinning: dial the vetted address directly so a rebinding nameserver
+  // can't swap in a private address between validation and connect. The
+  // hostname stays in `servername` for SNI and certificate verification.
+  const pinnedIP = pickConnectAddress(guard.addresses);
+
   return new Promise((resolve) => {
     const socket = tls.connect(
       {
-        host: domain,
+        host: pinnedIP,
         port: 443,
         servername: domain,
         timeout: 10000,
@@ -117,16 +139,23 @@ export async function scanSSL(domain: string): Promise<SSLResult> {
         // Check domain match (Bug fix P2: wildcard CNs must be properly validated, not blindly accepted)
         const subjectAltNames = cert.subjectaltname ?? '';
         const coveredByCN = subject === domain || matchesWildcard(subject, domain);
-        const coveredBySAN = subjectAltNames.includes(`DNS:${domain}`) ||
-          subjectAltNames.split(', ').some(
-            (san) => san.startsWith('DNS:*.') && matchesWildcard(san.slice(4), domain)
-          );
+        // Bug fix: an unbounded substring match (`includes('DNS:' + domain)`) let a
+        // SAN like "DNS:example.com.evil.com" cover "example.com". Compare each
+        // SAN entry exactly (case-insensitively), with proper wildcard handling.
+        const sanEntries = subjectAltNames
+          .split(',')
+          .map((entry) => entry.trim())
+          .filter((entry) => entry.toLowerCase().startsWith('dns:'))
+          .map((entry) => entry.slice(4).toLowerCase());
+        const coveredBySAN = sanEntries.some(
+          (san) => san === domain || matchesWildcard(san, domain)
+        );
         if (!coveredByCN && !coveredBySAN) {
           issues.push(`Certificate hostname mismatch: issued for "${subject}" but checking "${domain}".`);
         }
 
         // Check HTTP→HTTPS redirect
-        const redirectsToHttps = await checkHttpsRedirect(domain).catch(() => false);
+        const redirectsToHttps = await checkHttpsRedirect(domain, pinnedIP).catch(() => false);
         if (!redirectsToHttps) {
           issues.push('HTTP does not redirect to HTTPS — visitors on http:// get an unsecured connection.');
         }

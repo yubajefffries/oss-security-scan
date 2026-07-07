@@ -3,7 +3,16 @@
 // License: MIT
 // "Audit the audit" — full transparency by design.
 
-import dns from 'dns/promises';
+import dns, { Resolver } from 'dns/promises';
+
+/**
+ * DNSBL queries go through a dedicated resolver instance backed by the
+ * machine's own configured DNS servers. Public DoH resolvers (Cloudflare,
+ * Google) are blocked or rate-limited by Spamhaus and Barracuda, which
+ * silently under-reports listings - a direct resolver query is
+ * authoritative. Timeouts are capped so one dead DNSBL can't stall the scan.
+ */
+const dnsblResolver = new Resolver({ timeout: 5000, tries: 2 });
 
 export interface BlacklistListing {
   list: string;
@@ -26,6 +35,12 @@ export interface BlacklistResult {
   summary: string;
   /** True if all hits are PBL-only (shared provider IPs — expected, not actionable) */
   onlyPBL: boolean;
+  /**
+   * DNSBL queries that errored (timeout / SERVFAIL / network) - their status
+   * is UNKNOWN, not confirmed clean. Surfaced via issues[] and rendered as
+   * "not checked" (never "clean") by UI consumers.
+   */
+  unverified: Array<{ list: string; ip: string }>;
 }
 
 const DNSBL_LISTS = [
@@ -67,20 +82,43 @@ const SPAMHAUS_CODES: Record<string, { sublist: string; severity: 'critical' | '
   '127.0.0.11': { sublist: 'PBL',     severity: 'warning',  explanation: 'This IP is on the Policy Block List (PBL). PBL listings are normal for shared mail server IPs (Google, Microsoft, etc.) and are maintained by ISPs to prevent direct-send abuse. If you\'re using a major email provider, this is expected and typically not a deliverability issue.' },
 };
 
+/**
+ * Spamhaus error-range return codes (127.255.255.0/24): the query was
+ * refused, NOT answered from listing data. 252 = typing error / wrong
+ * query, 253 = query blocked, 254 = query sent via a public/open resolver.
+ * These mean the check could not be performed and must be treated as
+ * unverified - never as clean, and never as a listing.
+ */
+const SPAMHAUS_ERROR_CODES = new Set(['127.255.255.252', '127.255.255.253', '127.255.255.254']);
+
 async function reverseIP(ip: string): Promise<string> {
   return ip.split('.').reverse().join('.');
 }
 
+type DnsblOutcome =
+  | { outcome: 'listed'; responseCodes: string[] }
+  | { outcome: 'clean' }
+  | { outcome: 'error' };
+
 async function checkDNSBL(
   ip: string,
   list: (typeof DNSBL_LISTS)[number]
-): Promise<{ responseCodes: string[] } | null> {
+): Promise<DnsblOutcome> {
   try {
     const reversed = await reverseIP(ip);
-    const responseCodes = await dns.resolve4(`${reversed}.${list.host}`);
-    return { responseCodes };
-  } catch {
-    return null; // NXDOMAIN = not listed
+    const responseCodes = await dnsblResolver.resolve4(`${reversed}.${list.host}`);
+    // Strip Spamhaus error-range codes: they signal a refused/blocked query,
+    // not a listing. A response with only error codes is unverified.
+    const listingCodes = responseCodes.filter((code) => !SPAMHAUS_ERROR_CODES.has(code));
+    if (listingCodes.length === 0) return { outcome: 'error' };
+    return { outcome: 'listed', responseCodes: listingCodes };
+  } catch (err) {
+    // Only NXDOMAIN/no-data is an authoritative "not listed". Timeouts,
+    // SERVFAIL, refusals etc. mean the lookup is UNDETERMINABLE and must
+    // not be reported as clean.
+    const code = (err as NodeJS.ErrnoException | undefined)?.code;
+    if (code === 'ENOTFOUND' || code === 'ENODATA') return { outcome: 'clean' };
+    return { outcome: 'error' };
   }
 }
 
@@ -122,16 +160,22 @@ export async function scanBlacklist(domain: string): Promise<BlacklistResult> {
       issues: ['No mail server IPs found for this domain. Email may not be configured.'],
       summary: 'Could not find mail server IPs to check blacklist status.',
       onlyPBL: false,
+      unverified: [],
     };
   }
 
   const listedOn: BlacklistListing[] = [];
+  const unverified: Array<{ list: string; ip: string }> = [];
 
   await Promise.all(
     mxIPs.flatMap((ip) =>
       DNSBL_LISTS.map(async (list) => {
         const result = await checkDNSBL(ip, list);
-        if (!result) return;
+        if (result.outcome === 'error') {
+          unverified.push({ list: list.name, ip });
+          return;
+        }
+        if (result.outcome === 'clean') return;
 
         if (list.name === 'Spamhaus ZEN') {
           // Decode which sub-lists triggered
@@ -182,9 +226,22 @@ export async function scanBlacklist(domain: string): Promise<BlacklistResult> {
     return `IP ${l.ip} is listed on ${l.list}${sublistLabel}. Your emails may be blocked or sent to spam.`;
   });
 
+  for (const u of unverified) {
+    issues.push(`Could not check ${u.list} for IP ${u.ip} (query failed) - status unknown, not confirmed clean.`);
+  }
+
+  const totalChecks = mxIPs.length * DNSBL_LISTS.length;
+
   let status: BlacklistResult['status'];
   if (listedOn.length === 0) {
-    status = 'pass';
+    // Never report "Clean" when queries errored: an unreachable DNSBL is
+    // undeterminable, not a confirmed-clean result.
+    status =
+      unverified.length === 0
+        ? 'pass'
+        : unverified.length >= totalChecks
+        ? 'error'
+        : 'warning';
   } else if (criticalListings.length >= 2) {
     status = 'critical';
   } else if (criticalListings.length === 1) {
@@ -203,6 +260,14 @@ export async function scanBlacklist(domain: string): Promise<BlacklistResult> {
     error: 'Could not complete blacklist scan.',
   };
 
+  let summary = summaries[status];
+  if (listedOn.length === 0 && unverified.length > 0) {
+    summary =
+      unverified.length >= totalChecks
+        ? 'Blocklist queries failed - could not determine blacklist status.'
+        : `No listings found on the blocklists we could reach, but ${unverified.length} of ${totalChecks} queries failed and could not be verified.`;
+  }
+
   return {
     status,
     mxHosts,
@@ -210,7 +275,8 @@ export async function scanBlacklist(domain: string): Promise<BlacklistResult> {
     listedOn,
     checkedLists: DNSBL_LISTS.map((l) => ({ name: l.name, description: l.description })),
     issues,
-    summary: summaries[status],
+    summary,
     onlyPBL,
+    unverified,
   };
 }
