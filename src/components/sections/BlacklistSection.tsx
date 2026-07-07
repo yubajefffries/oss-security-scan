@@ -1,25 +1,50 @@
 import { useState } from 'react';
-import type { BlacklistReport } from '../../lib/blacklist-checker';
+import type { BlacklistReport, BlacklistResult } from '../../lib/blacklist-checker';
 import InsightCard from '../shared/InsightCard';
 
 interface Props {
   report: BlacklistReport;
 }
 
+/** Visual state per list: an errored query is "not checked", never "clean". */
+type ItemState = 'listed' | 'clean' | 'unverified';
+
+function itemState(bl: BlacklistResult): ItemState {
+  if (bl.queryStatus === 'error') return 'unverified';
+  return bl.listed ? 'listed' : 'clean';
+}
+
+const STATE_ICON: Record<ItemState, string> = {
+  listed: '⚠',
+  clean: '✓',
+  unverified: '?',
+};
+
+const STATE_BADGE: Record<ItemState, { className: string; label: string }> = {
+  listed: { className: 'fail', label: 'Listed' },
+  clean: { className: 'pass', label: 'Clean' },
+  unverified: { className: 'warn', label: 'Not checked' },
+};
+
 export default function BlacklistSection({ report }: Props) {
   const [showLowConfidence, setShowLowConfidence] = useState(false);
   const [showPrevention, setShowPrevention] = useState(false);
 
-  const highConfidence = report.results.filter((r) => r.confidence !== 'low');
-  const lowConfidence = report.results.filter((r) => r.confidence === 'low');
+  // Low-confidence listings (e.g. Spamhaus PBL-only hits) stay behind the
+  // toggle; errored queries are shown in the main grid as "not checked".
+  const lowConfidenceListings = report.results.filter((r) => r.listed && r.confidence === 'low');
+  const mainResults = report.results.filter((r) => !(r.listed && r.confidence === 'low'));
+
   const listedCount = report.results.filter((r) => r.listed && r.confidence !== 'low').length;
+  const cleanCount = report.results.filter((r) => r.queryStatus === 'clean').length;
+  const erroredCount = report.results.filter((r) => r.queryStatus === 'error').length;
 
   return (
     <section>
       <h2 style={{ fontSize: '1.1rem', marginBottom: 'var(--space-4)' }}>
         Blacklist Check
         <span style={{ fontWeight: 400, fontSize: '0.85rem', color: 'var(--dh-muted)', marginLeft: '8px' }}>
-          IP: {report.ip}
+          IP: {report.ip} — {cleanCount} clean, {erroredCount} not checked (query failed), {listedCount} listed
         </span>
       </h2>
 
@@ -47,6 +72,12 @@ export default function BlacklistSection({ report }: Props) {
             <li>Investigate the root cause: compromised email accounts, open mail relays, or misconfigured servers are the usual culprits.</li>
           </ol>
         </InsightCard>
+      ) : erroredCount > 0 ? (
+        <InsightCard type="info" title={`Clean on ${cleanCount} list${cleanCount !== 1 ? 's' : ''} - ${erroredCount} could not be checked`}>
+          No listings were found on the blacklists we could reach, but {erroredCount} quer{erroredCount > 1 ? 'ies' : 'y'} failed.
+          A failed query means that list could not be verified - it does not confirm you are clean
+          on it. Re-run the scan later to retry the failed lists.
+        </InsightCard>
       ) : (
         <InsightCard type="success" title="All Clear">
           Your IP is not listed on any major blacklists. Good standing with email providers.
@@ -54,27 +85,31 @@ export default function BlacklistSection({ report }: Props) {
       )}
 
       <div className="blacklist-grid">
-        {highConfidence.map((bl) => (
-          <div key={bl.host} className={`blacklist-item blacklist-item--${bl.listed ? 'listed' : 'clean'}`}>
-            <span className="blacklist-item__icon" aria-hidden="true">
-              {bl.listed ? '\u26A0' : '\u2713'}
-            </span>
-            <div className="blacklist-item__info">
-              <p className="blacklist-item__name">
-                <a href={bl.removalUrl} target="_blank" rel="noopener noreferrer" className="blacklist-item__link">
-                  {bl.name}
-                </a>
-              </p>
-              <p className="blacklist-item__desc">{bl.description}</p>
-              {bl.listed && bl.note && (
-                <p className="blacklist-item__note">{bl.note}</p>
-              )}
+        {mainResults.map((bl) => {
+          const state = itemState(bl);
+          const badge = STATE_BADGE[state];
+          return (
+            <div key={bl.host} className={`blacklist-item blacklist-item--${state}`}>
+              <span className="blacklist-item__icon" aria-hidden="true">
+                {STATE_ICON[state]}
+              </span>
+              <div className="blacklist-item__info">
+                <p className="blacklist-item__name">
+                  <a href={bl.removalUrl} target="_blank" rel="noopener noreferrer" className="blacklist-item__link">
+                    {bl.name}
+                  </a>
+                </p>
+                <p className="blacklist-item__desc">{bl.description}</p>
+                {state !== 'clean' && bl.note && (
+                  <p className="blacklist-item__note">{bl.note}</p>
+                )}
+              </div>
+              <span className={`status-badge status-badge--${badge.className}`}>
+                {badge.label}
+              </span>
             </div>
-            <span className={`status-badge status-badge--${bl.listed ? 'fail' : 'pass'}`}>
-              {bl.listed ? 'Listed' : 'Clean'}
-            </span>
-          </div>
-        ))}
+          );
+        })}
       </div>
 
       <details
@@ -94,7 +129,7 @@ export default function BlacklistSection({ report }: Props) {
         </div>
       </details>
 
-      {lowConfidence.length > 0 && (
+      {lowConfidenceListings.length > 0 && (
         <div style={{ marginTop: 'var(--space-4)' }}>
           <button
             type="button"
@@ -102,28 +137,24 @@ export default function BlacklistSection({ report }: Props) {
             onClick={() => setShowLowConfidence(!showLowConfidence)}
             style={{ fontSize: '0.8rem' }}
           >
-            {showLowConfidence ? 'Hide' : 'Show'} low-confidence results ({lowConfidence.length})
+            {showLowConfidence ? 'Hide' : 'Show'} low-confidence results ({lowConfidenceListings.length})
           </button>
 
           {showLowConfidence && (
             <div className="blacklist-grid" style={{ marginTop: 'var(--space-3)' }}>
-              {lowConfidence.map((bl) => (
-                <div key={bl.host} className={`blacklist-item blacklist-item--${bl.listed ? 'listed' : 'clean'} blacklist-item--low`}>
-                  <span className="blacklist-item__icon" aria-hidden="true">
-                    {bl.listed ? '?' : '\u2713'}
-                  </span>
+              {lowConfidenceListings.map((bl) => (
+                <div key={bl.host} className="blacklist-item blacklist-item--listed blacklist-item--low">
+                  <span className="blacklist-item__icon" aria-hidden="true">?</span>
                   <div className="blacklist-item__info">
                     <p className="blacklist-item__name">
-                <a href={bl.removalUrl} target="_blank" rel="noopener noreferrer" className="blacklist-item__link">
-                  {bl.name}
-                </a>
-              </p>
+                      <a href={bl.removalUrl} target="_blank" rel="noopener noreferrer" className="blacklist-item__link">
+                        {bl.name}
+                      </a>
+                    </p>
                     <p className="blacklist-item__desc">{bl.description}</p>
                     {bl.note && <p className="blacklist-item__note">{bl.note}</p>}
                   </div>
-                  <span className={`status-badge status-badge--${bl.listed ? 'warn' : 'pass'}`}>
-                    {bl.listed ? 'Low confidence' : 'Clean'}
-                  </span>
+                  <span className="status-badge status-badge--warn">Low confidence</span>
                 </div>
               ))}
             </div>

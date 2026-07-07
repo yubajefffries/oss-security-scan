@@ -58,7 +58,8 @@ function formatAllResultsText(state: ScanState): string {
     out += `--- Blacklist Check (IP: ${state.blacklist.ip}) ---\n`;
     if (state.blacklist.isSharedHosting) out += `Note: Shared hosting/CDN IP detected\n`;
     for (const bl of state.blacklist.results) {
-      out += `${bl.name}: ${bl.listed ? 'LISTED' : 'Clean'}`;
+      // An errored query is unknown, not clean - say so in the report too.
+      out += `${bl.name}: ${bl.listed ? 'LISTED' : bl.queryStatus === 'error' ? 'NOT CHECKED (query failed)' : 'Clean'}`;
       if (bl.note) out += ` (${bl.note})`;
       out += '\n';
     }
@@ -219,8 +220,14 @@ export default function DomainSecurityScanner() {
   const dnsHealthy = state?.dns
     ? Object.values(state.dns).some(({ records }) => records.length > 0)
     : false;
-  const blacklistClean = state?.blacklist
-    ? state.blacklist.results.filter((r) => r.confidence !== 'low').every((r) => !r.listed)
+  // 'unverified' when nothing is confirmed listed but some queries failed:
+  // those lists could not be checked, so "clean" would overclaim.
+  const blacklistStatus = state?.blacklist
+    ? state.blacklist.results.some((r) => r.listed && r.confidence !== 'low')
+      ? 'listed' as const
+      : state.blacklist.results.some((r) => r.queryStatus === 'error')
+        ? 'unverified' as const
+        : 'clean' as const
     : null;
 
   return (
@@ -238,7 +245,7 @@ export default function DomainSecurityScanner() {
           <SecuritySummary
             dnsHealthy={dnsHealthy}
             emailGrade={state.emailAuth?.grade ?? null}
-            blacklistClean={blacklistClean}
+            blacklistStatus={blacklistStatus}
             headersScore={state.headers ? { score: state.headers.score, maxScore: state.headers.maxScore, status: state.headers.status } : null}
           />
 

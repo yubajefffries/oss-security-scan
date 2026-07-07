@@ -1,13 +1,16 @@
 import type { Grade } from '../../lib/email-auth-grader';
 
+/** 'unverified' = no confirmed listings, but at least one query failed */
+export type BlacklistSummaryStatus = 'clean' | 'listed' | 'unverified';
+
 interface Props {
   dnsHealthy: boolean;
   emailGrade: Grade | null;
-  blacklistClean: boolean | null;
+  blacklistStatus: BlacklistSummaryStatus | null;
   headersScore: { score: number; maxScore: number; status: string } | null;
 }
 
-export default function SecuritySummary({ dnsHealthy, emailGrade, blacklistClean, headersScore }: Props) {
+export default function SecuritySummary({ dnsHealthy, emailGrade, blacklistStatus, headersScore }: Props) {
   return (
     <div className="security-summary">
       <div className="security-summary__item">
@@ -34,14 +37,20 @@ export default function SecuritySummary({ dnsHealthy, emailGrade, blacklistClean
 
       <div className="security-summary__item">
         <span className={`security-summary__indicator security-summary__indicator--${
-          blacklistClean === null ? 'pending' : blacklistClean ? 'pass' : 'fail'
+          blacklistStatus === null ? 'pending' : blacklistStatus === 'clean' ? 'pass' : blacklistStatus === 'unverified' ? 'warn' : 'fail'
         }`} aria-hidden="true">
-          {blacklistClean === null ? '...' : blacklistClean ? '✓' : '!'}
+          {blacklistStatus === null ? '...' : blacklistStatus === 'clean' ? '✓' : blacklistStatus === 'unverified' ? '?' : '!'}
         </span>
         <div>
           <p className="security-summary__label">Blacklist Status</p>
           <p className="security-summary__value">
-            {blacklistClean === null ? 'Checking...' : blacklistClean ? 'All Clear' : 'Listed'}
+            {blacklistStatus === null
+              ? 'Checking...'
+              : blacklistStatus === 'clean'
+                ? 'All Clear'
+                : blacklistStatus === 'unverified'
+                  ? 'Not Fully Checked'
+                  : 'Listed'}
           </p>
         </div>
       </div>

@@ -8,7 +8,7 @@ export interface BlacklistResult {
   name: string;
   host: string;
   listed: boolean;
-  /** 'error' = the DNSBL query failed; NOT confirmed clean. TODO(UI): render distinctly from a clean result. */
+  /** 'error' = the DNSBL query failed; NOT confirmed clean. Rendered as "Not checked" in the UI. */
   queryStatus: 'listed' | 'clean' | 'error';
   returnCodes: string[];
   confidence: Confidence;

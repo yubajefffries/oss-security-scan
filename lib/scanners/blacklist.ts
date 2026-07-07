@@ -28,8 +28,8 @@ export interface BlacklistResult {
   onlyPBL: boolean;
   /**
    * DNSBL queries that errored (timeout / SERVFAIL / network) - their status
-   * is UNKNOWN, not confirmed clean. TODO(UI): surface these in
-   * BlacklistSection instead of implying a clean result.
+   * is UNKNOWN, not confirmed clean. Surfaced via issues[] and rendered as
+   * "not checked" (never "clean") by UI consumers.
    */
   unverified: Array<{ list: string; ip: string }>;
 }
